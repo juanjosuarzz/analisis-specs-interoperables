@@ -19,6 +19,14 @@ def _normalize_col(df: pd.DataFrame, col: str) -> str:
             return c
     raise KeyError(f"Column '{col}' not found. Available: {list(df.columns)}")
 
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for cand in candidates:
+        try:
+            return _normalize_col(df, cand)
+        except KeyError:
+            continue
+    return None
+
 def load_workbook(file_path: str):
     """Load required sheets from the Excel workbook."""
     xls = pd.ExcelFile(file_path)
@@ -35,29 +43,55 @@ def pick_main_sheet(sheets: dict) -> str:
     return next(iter(sheets.keys()))
 
 def build_hierarchy(herencias_df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare hierarchy table with normalized parent/child columns."""
-    parent_col = _normalize_col(herencias_df, 'Parent ABB')
-    child_col = _normalize_col(herencias_df, 'Child ABB')
+    """Prepare hierarchy table with normalized parent/child columns.
+
+    Supports Spanish column names found in the user workbook:
+      - ABB Madre (parent)
+      - ABB Hija (child)
+
+    Also supports English names:
+      - Parent ABB
+      - Child ABB
+    """
+    parent_col = _first_existing_col(herencias_df, ['Parent ABB', 'ABB Madre', 'ABB madre', 'Parent'])
+    child_col = _first_existing_col(herencias_df, ['Child ABB', 'ABB Hija', 'ABB hija', 'Child'])
+
+    if parent_col is None or child_col is None:
+        raise KeyError(
+            "No se encontraron las columnas de herencia (Parent/Child). "
+            f"Columnas disponibles: {list(herencias_df.columns)}"
+        )
 
     h = herencias_df[[parent_col, child_col]].copy()
     h.columns = ['Parent ABB', 'Child ABB']
+
+    # Drop NaN before converting to str to avoid 'nan' strings and float/str mixing
+    h = h.dropna(subset=['Parent ABB', 'Child ABB'])
+
     h['Parent ABB'] = h['Parent ABB'].astype(str).str.strip()
     h['Child ABB'] = h['Child ABB'].astype(str).str.strip()
 
-    # Drop blanks
-    h = h[(h['Child ABB'] != '') & (h['Child ABB'].str.lower() != 'nan')]
+    # Drop blanks and 'nan' (string)
+    h = h[(h['Parent ABB'] != '') & (h['Child ABB'] != '')]
+    h = h[(h['Parent ABB'].str.lower() != 'nan') & (h['Child ABB'].str.lower() != 'nan')]
+
     h = h.drop_duplicates().reset_index(drop=True)
     return h
 
 def compute_levels(h: pd.DataFrame):
     """Compute level (depth) from roots for each ABB and the root parent."""
-    parents = set(h['Parent ABB'])
-    children = set(h['Child ABB'])
+    # Ensure types are strings
+    h2 = h.copy()
+    h2['Parent ABB'] = h2['Parent ABB'].astype(str)
+    h2['Child ABB'] = h2['Child ABB'].astype(str)
+
+    parents = set(h2['Parent ABB'])
+    children = set(h2['Child ABB'])
     roots = sorted(list(parents - children))
 
     # adjacency from parent to children
     adj = {}
-    for p, c in h[['Parent ABB', 'Child ABB']].itertuples(index=False):
+    for p, c in h2[['Parent ABB', 'Child ABB']].itertuples(index=False):
         adj.setdefault(p, []).append(c)
 
     level = {}
@@ -80,7 +114,7 @@ def compute_levels(h: pd.DataFrame):
                 q.append(ch)
 
     # Handle disconnected nodes (cycles or missing roots)
-    for n in sorted(list(parents | children)):
+    for n in sorted(map(str, parents | children)):
         if n not in level:
             level[n] = np.nan
             root_of[n] = None
@@ -94,23 +128,15 @@ def compute_levels(h: pd.DataFrame):
 
 def attach_hierarchy_to_specs(main_df: pd.DataFrame, h_levels: pd.DataFrame) -> pd.DataFrame:
     """Attach EIRA hierarchy metadata to each spec row based on its assigned ABB."""
-    abb_col = None
-    for candidate in ['ABB', 'Child ABB', 'ABBs', 'EIRA ABB']:
-        try:
-            abb_col = _normalize_col(main_df, candidate)
-            break
-        except KeyError:
-            continue
+    abb_col = _first_existing_col(main_df, ['ABB', 'Child ABB', 'ABBs', 'EIRA ABB', 'ABB Hija', 'ABB hija'])
     if abb_col is None:
-        raise KeyError("Could not find an ABB column in main sheet. Expected one of: ABB, Child ABB, ABBs, EIRA ABB")
+        raise KeyError(
+            "No se encontró la columna ABB en la pestaña principal. "
+            "Esperaba algo como: ABB, ABBs, Child ABB, EIRA ABB, ABB Hija. "
+            f"Columnas disponibles: {list(main_df.columns)}"
+        )
 
-    view_col = None
-    for candidate in ['View', 'EIRA View']:
-        try:
-            view_col = _normalize_col(main_df, candidate)
-            break
-        except KeyError:
-            continue
+    view_col = _first_existing_col(main_df, ['View', 'EIRA View', 'Vista'])
 
     specs = main_df.copy()
     specs['ABB'] = specs[abb_col].astype(str).str.strip()
@@ -118,11 +144,7 @@ def attach_hierarchy_to_specs(main_df: pd.DataFrame, h_levels: pd.DataFrame) -> 
         specs['View'] = specs[view_col].astype(str).str.strip()
 
     # Merge level/root info
-    m = h_levels.rename(columns={'ABB': 'ABB'})
-    specs = specs.merge(m, how='left', on='ABB')
-
-    # Derive immediate parent if ABB is a child in herencias
-    # This is useful for coverage by Parent ABB.
+    specs = specs.merge(h_levels, how='left', left_on='ABB', right_on='ABB')
     return specs
 
 def compute_parent_lookup(h: pd.DataFrame) -> dict:
@@ -130,12 +152,12 @@ def compute_parent_lookup(h: pd.DataFrame) -> dict:
     from collections import defaultdict
     d = defaultdict(list)
     for p, c in h[['Parent ABB', 'Child ABB']].itertuples(index=False):
-        d[c].append(p)
+        d[str(c)].append(str(p))
     return dict(d)
 
 def add_parent_columns(specs: pd.DataFrame, parent_lookup: dict) -> pd.DataFrame:
     specs = specs.copy()
-    specs['Parent ABB(s)'] = specs['ABB'].map(lambda x: parent_lookup.get(x, []))
+    specs['Parent ABB(s)'] = specs['ABB'].map(lambda x: parent_lookup.get(str(x), []))
     specs['Parent ABB'] = specs['Parent ABB(s)'].map(lambda xs: xs[0] if isinstance(xs, list) and len(xs) else None)
     return specs
 
@@ -157,33 +179,19 @@ def pareto_parent_abbs(specs: pd.DataFrame, threshold: float = 0.8) -> pd.DataFr
     counts['CumCount'] = counts['Count'].cumsum()
     counts['CumPct'] = counts['CumCount'] / total if total else 0
     critical = counts[counts['CumPct'] <= threshold].head(5)
-    # Ensure at least 5 rows if possible
     if len(critical) < 5:
         critical = counts.head(5)
     return critical
 
 def gaps_child_abbs(h: pd.DataFrame, specs: pd.DataFrame) -> pd.DataFrame:
-    all_children = set(h['Child ABB'])
+    all_children = set(h['Child ABB'].astype(str))
     used = set(specs['ABB'].dropna().astype(str))
     missing = sorted(list(all_children - used))
     return pd.DataFrame({'Child ABB with no specification': missing})
 
 def quality_by_level(specs: pd.DataFrame) -> pd.DataFrame:
-    # Try to find quality columns
-    score_col = None
-    dist_col = None
-    for c in ['Automated score(s)', 'Automated scores', 'Automated score']:
-        try:
-            score_col = _normalize_col(specs, c)
-            break
-        except KeyError:
-            continue
-    for c in ['Assessment distribution(s)', 'Assessment distribution']:
-        try:
-            dist_col = _normalize_col(specs, c)
-            break
-        except KeyError:
-            continue
+    score_col = _first_existing_col(specs, ['Automated score(s)', 'Automated scores', 'Automated score'])
+    dist_col = _first_existing_col(specs, ['Assessment distribution(s)', 'Assessment distribution'])
 
     q = specs.copy()
     if score_col is not None:
@@ -192,16 +200,16 @@ def quality_by_level(specs: pd.DataFrame) -> pd.DataFrame:
     else:
         q['Automated score(s) num'] = np.nan
 
-    # Summaries by level
     grp = q.groupby('EIRA Level', dropna=False).agg(
         specs_count=('ABB', 'count'),
         avg_score=('Automated score(s) num', 'mean'),
         median_score=('Automated score(s) num', 'median'),
     ).reset_index()
 
-    # Keep distribution as a sample list per level if exists
     if dist_col is not None:
-        dist = q.groupby('EIRA Level', dropna=False)[dist_col].apply(lambda s: list(s.dropna().astype(str).unique())[:10]).reset_index(name='Assessment distribution(s) sample')
+        dist = q.groupby('EIRA Level', dropna=False)[dist_col].apply(
+            lambda s: list(s.dropna().astype(str).unique())[:10]
+        ).reset_index(name='Assessment distribution(s) sample')
         grp = grp.merge(dist, on='EIRA Level', how='left')
 
     return grp
@@ -248,14 +256,13 @@ def export_excel(specs: pd.DataFrame, cov: pd.DataFrame, pareto: pd.DataFrame, g
 def main(input_file: str = INPUT_FILE_DEFAULT, output_file: str = OUTPUT_FILE_DEFAULT):
     sheets = load_workbook(input_file)
 
-    # Hierarchy sheet
     if 'Herencias ABBs EIRA 7.0' not in sheets:
         raise KeyError(f"Missing required sheet 'Herencias ABBs EIRA 7.0'. Found: {list(sheets.keys())}")
+
     herencias = sheets['Herencias ABBs EIRA 7.0']
     h = build_hierarchy(herencias)
     roots, adj, h_levels = compute_levels(h)
 
-    # Main sheet (specs)
     main_sheet = pick_main_sheet(sheets)
     main_df = sheets[main_sheet]
 
@@ -271,7 +278,6 @@ def main(input_file: str = INPUT_FILE_DEFAULT, output_file: str = OUTPUT_FILE_DE
     print_summary(specs, cov, pareto, gaps, qual)
     export_excel(specs, cov, pareto, gaps, qual, output_file)
 
-    # Optional visualization
     create_sunburst(specs)
 
 if __name__ == '__main__':
